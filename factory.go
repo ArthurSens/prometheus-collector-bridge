@@ -47,31 +47,7 @@ type ConfigUnmarshaler interface {
 type FactoryOption func(*factoryConfig)
 
 type factoryConfig struct {
-	typeStr           component.Type
-	lifecycleManager  ExporterLifecycleManager
-	configUnmarshaler ConfigUnmarshaler
-	defaultConfig     map[string]interface{}
-}
-
-// WithType sets the receiver type identifier.
-func WithType(typeStr component.Type) FactoryOption {
-	return func(cfg *factoryConfig) {
-		cfg.typeStr = typeStr
-	}
-}
-
-// WithInitializer sets the exporter initializer.
-func WithLifecycleManager(lifecycleManager ExporterLifecycleManager) FactoryOption {
-	return func(cfg *factoryConfig) {
-		cfg.lifecycleManager = lifecycleManager
-	}
-}
-
-// WithConfigUnmarshaler sets the config unmarshaler.
-func WithConfigUnmarshaler(unmarshaler ConfigUnmarshaler) FactoryOption {
-	return func(cfg *factoryConfig) {
-		cfg.configUnmarshaler = unmarshaler
-	}
+	defaultConfig map[string]interface{}
 }
 
 // WithComponentDefaults sets the default configuration for the component.
@@ -82,22 +58,35 @@ func WithComponentDefaults(defaults map[string]interface{}) FactoryOption {
 }
 
 // NewFactory creates a new receiver factory for a Prometheus exporter.
-// The factory uses the provided ExporterInitializer and ConfigUnmarshaler
+// The factory uses the provided type, ExporterLifecycleManager, and ConfigUnmarshaler
 // to manage the exporter lifecycle and configuration.
-func NewFactory(opts ...FactoryOption) receiver.Factory {
+//
+// Required parameters:
+//   - typeStr: The receiver type identifier (e.g., "node_exporter")
+//   - lifecycleManager: Handles starting/stopping the exporter
+//   - configUnmarshaler: Unmarshals exporter-specific configuration
+//
+// Optional parameters via FactoryOption:
+//   - WithComponentDefaults: Sets default exporter configuration values
+func NewFactory(
+	typeStr component.Type,
+	lifecycleManager ExporterLifecycleManager,
+	configUnmarshaler ConfigUnmarshaler,
+	opts ...FactoryOption,
+) receiver.Factory {
+	if typeStr.String() == "" {
+		panic("receiver type must be specified")
+	}
+	if lifecycleManager == nil {
+		panic("lifecycle manager must not be nil")
+	}
+	if configUnmarshaler == nil {
+		panic("config unmarshaler must not be nil")
+	}
+
 	cfg := &factoryConfig{}
 	for _, opt := range opts {
 		opt(cfg)
-	}
-
-	if cfg.typeStr.String() == "" {
-		panic("receiver type must be specified")
-	}
-	if cfg.lifecycleManager == nil {
-		panic("exporter initializer must be specified")
-	}
-	if cfg.configUnmarshaler == nil {
-		panic("config unmarshaler must be specified")
 	}
 
 	componentDefaultsFunc := func() component.Config {
@@ -107,10 +96,10 @@ func NewFactory(opts ...FactoryOption) receiver.Factory {
 	}
 
 	return receiver.NewFactory(
-		cfg.typeStr,
+		typeStr,
 		componentDefaultsFunc,
 		receiver.WithMetrics(
-			createMetricsReceiver(cfg.lifecycleManager, cfg.configUnmarshaler),
+			createMetricsReceiver(lifecycleManager, configUnmarshaler),
 			component.StabilityLevelAlpha,
 		),
 	)
