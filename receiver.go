@@ -70,7 +70,7 @@ func (r *prometheusReceiver) Start(ctx context.Context, host component.Host) err
 	// Create the scraper
 	r.scraper = newScraper(
 		r.registry,
-		r.consumer,
+		r.settings.ID.Type(),
 		r.settings.Logger,
 	)
 
