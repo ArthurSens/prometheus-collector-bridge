@@ -72,54 +72,18 @@ func (t *testExporterConfig) Validate() error {
 	return nil
 }
 
-func TestNewFactory_Panics(t *testing.T) {
+func TestNewFactory_Basic(t *testing.T) {
 	tests := []struct {
-		name      string
-		opts      []FactoryOption
-		wantPanic bool
-		panicMsg  string
+		name string
+		opts []FactoryOption
 	}{
 		{
-			name: "missing type",
-			opts: []FactoryOption{
-				WithLifecycleManager(&mockLifecycleManager{}),
-				WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
-			},
-			wantPanic: true,
-			panicMsg:  "receiver type must be specified",
+			name: "required parameters only",
+			opts: nil,
 		},
 		{
-			name: "missing lifecycle manager",
+			name: "with component defaults",
 			opts: []FactoryOption{
-				WithType(component.MustNewType("test")),
-				WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
-			},
-			wantPanic: true,
-			panicMsg:  "exporter initializer must be specified",
-		},
-		{
-			name: "missing config unmarshaler",
-			opts: []FactoryOption{
-				WithType(component.MustNewType("test")),
-				WithLifecycleManager(&mockLifecycleManager{}),
-			},
-			wantPanic: true,
-			panicMsg:  "config unmarshaler must be specified",
-		},
-		{
-			name: "all required options present",
-			opts: []FactoryOption{
-				WithType(component.MustNewType("test")),
-				WithLifecycleManager(&mockLifecycleManager{}),
-				WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
-			},
-		},
-		{
-			name: "all options including defaults",
-			opts: []FactoryOption{
-				WithType(component.MustNewType("prometheustest")),
-				WithLifecycleManager(&mockLifecycleManager{}),
-				WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
 				WithComponentDefaults(map[string]interface{}{
 					"enable_feature": true,
 					"timeout":        "30s",
@@ -130,30 +94,72 @@ func TestNewFactory_Panics(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			factory := NewFactory(
+				component.MustNewType("test"),
+				&mockLifecycleManager{},
+				&mockConfigUnmarshaler{},
+				tt.opts...,
+			)
+
+			if factory == nil {
+				t.Error("NewFactory() returned nil factory")
+			}
+		})
+	}
+}
+
+func TestNewFactory_Panics(t *testing.T) {
+	tests := []struct {
+		name              string
+		typeStr           component.Type
+		lifecycleManager  ExporterLifecycleManager
+		configUnmarshaler ConfigUnmarshaler
+		wantPanicMsg      string
+	}{
+		{
+			name:              "empty type string",
+			typeStr:           component.Type{},
+			lifecycleManager:  &mockLifecycleManager{},
+			configUnmarshaler: &mockConfigUnmarshaler{},
+			wantPanicMsg:      "receiver type must be specified",
+		},
+		{
+			name:              "nil lifecycle manager",
+			typeStr:           component.MustNewType("test"),
+			lifecycleManager:  nil,
+			configUnmarshaler: &mockConfigUnmarshaler{},
+			wantPanicMsg:      "lifecycle manager must not be nil",
+		},
+		{
+			name:              "nil config unmarshaler",
+			typeStr:           component.MustNewType("test"),
+			lifecycleManager:  &mockLifecycleManager{},
+			configUnmarshaler: nil,
+			wantPanicMsg:      "config unmarshaler must not be nil",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			defer func() {
 				r := recover()
-				if (r != nil) != tt.wantPanic {
-					t.Errorf("NewFactory() panic = %v, wantPanic %v", r != nil, tt.wantPanic)
-					return
+				if r == nil {
+					t.Fatal("NewFactory() did not panic")
 				}
-				if tt.wantPanic && r != nil {
-					panicMsg, ok := r.(string)
-					if !ok {
-						t.Errorf("panic value is not a string: %v", r)
-						return
-					}
-					if panicMsg != tt.panicMsg {
-						t.Errorf("panic message = %v, want %v", panicMsg, tt.panicMsg)
-					}
+				panicMsg, ok := r.(string)
+				if !ok {
+					t.Fatalf("panic value is not a string: %v", r)
+				}
+				if panicMsg != tt.wantPanicMsg {
+					t.Errorf("panic message = %q, want %q", panicMsg, tt.wantPanicMsg)
 				}
 			}()
 
-			factory := NewFactory(tt.opts...)
-
-			// Verify factory was created if no panic expected
-			if !tt.wantPanic && factory == nil {
-				t.Error("NewFactory() returned nil factory")
-			}
+			NewFactory(
+				tt.typeStr,
+				tt.lifecycleManager,
+				tt.configUnmarshaler,
+			)
 		})
 	}
 }
@@ -161,22 +167,23 @@ func TestNewFactory_Panics(t *testing.T) {
 func TestNewFactory_DefaultConfig(t *testing.T) {
 	tests := []struct {
 		name               string
-		componentDefaults  map[string]interface{}
+		opts               []FactoryOption
 		wantScrapeInterval time.Duration
 		wantExporterConfig map[string]interface{}
 	}{
 		{
 			name:               "default config without component defaults",
-			componentDefaults:  nil,
 			wantScrapeInterval: 30 * time.Second,
 			wantExporterConfig: nil,
 		},
 		{
 			name: "default config with component defaults",
-			componentDefaults: map[string]interface{}{
-				"enable_feature": true,
-				"timeout":        "30s",
-				"port":           8080,
+			opts: []FactoryOption{
+				WithComponentDefaults(map[string]interface{}{
+					"enable_feature": true,
+					"timeout":        "30s",
+					"port":           8080,
+				}),
 			},
 			wantScrapeInterval: 30 * time.Second,
 			wantExporterConfig: map[string]interface{}{
@@ -189,16 +196,12 @@ func TestNewFactory_DefaultConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opts := []FactoryOption{
-				WithType(component.MustNewType("test")),
-				WithLifecycleManager(&mockLifecycleManager{}),
-				WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
-			}
-			if tt.componentDefaults != nil {
-				opts = append(opts, WithComponentDefaults(tt.componentDefaults))
-			}
-
-			factory := NewFactory(opts...)
+			factory := NewFactory(
+				component.MustNewType("test"),
+				&mockLifecycleManager{},
+				&mockConfigUnmarshaler{},
+				tt.opts...,
+			)
 			if factory == nil {
 				t.Fatal("NewFactory() returned nil")
 			}
@@ -238,9 +241,9 @@ func TestNewFactory_DefaultConfig(t *testing.T) {
 func TestCreateMetricsReceiver_EmptyExporterConfig(t *testing.T) {
 	receiverType := component.MustNewType("test")
 	factory := NewFactory(
-		WithType(receiverType),
-		WithLifecycleManager(&mockLifecycleManager{}),
-		WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
+		receiverType,
+		&mockLifecycleManager{},
+		&mockConfigUnmarshaler{},
 	)
 
 	cfg := &ReceiverConfig{
@@ -271,9 +274,9 @@ func TestCreateMetricsReceiver_ValidExporterConfig(t *testing.T) {
 	}
 
 	factory := NewFactory(
-		WithType(receiverType),
-		WithLifecycleManager(&mockLifecycleManager{}),
-		WithConfigUnmarshaler(unmarshaler),
+		receiverType,
+		&mockLifecycleManager{},
+		unmarshaler,
 	)
 
 	cfg := &ReceiverConfig{
@@ -333,9 +336,9 @@ func TestCreateMetricsReceiver_UnknownFieldsRejected(t *testing.T) {
 	}
 
 	factory := NewFactory(
-		WithType(receiverType),
-		WithLifecycleManager(&mockLifecycleManager{}),
-		WithConfigUnmarshaler(unmarshaler),
+		receiverType,
+		&mockLifecycleManager{},
+		unmarshaler,
 	)
 
 	cfg := &ReceiverConfig{
@@ -371,9 +374,9 @@ func TestCreateMetricsReceiver_TypeMismatch(t *testing.T) {
 	}
 
 	factory := NewFactory(
-		WithType(receiverType),
-		WithLifecycleManager(&mockLifecycleManager{}),
-		WithConfigUnmarshaler(unmarshaler),
+		receiverType,
+		&mockLifecycleManager{},
+		unmarshaler,
 	)
 
 	tests := []struct {
@@ -436,9 +439,9 @@ func TestCreateMetricsReceiver_ConfigValidationFails(t *testing.T) {
 	}
 
 	factory := NewFactory(
-		WithType(receiverType),
-		WithLifecycleManager(&mockLifecycleManager{}),
-		WithConfigUnmarshaler(unmarshaler),
+		receiverType,
+		&mockLifecycleManager{},
+		unmarshaler,
 	)
 
 	tests := []struct {
@@ -493,13 +496,13 @@ func TestCreateMetricsReceiver_ConfigValidationFails(t *testing.T) {
 }
 
 func TestFactoryOptions(t *testing.T) {
-	t.Run("WithType", func(t *testing.T) {
+	t.Run("Type", func(t *testing.T) {
 		expectedType := component.MustNewType("prometheustest")
 
 		factory := NewFactory(
-			WithType(expectedType),
-			WithLifecycleManager(&mockLifecycleManager{}),
-			WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
+			expectedType,
+			&mockLifecycleManager{},
+			&mockConfigUnmarshaler{},
 		)
 
 		if factory.Type() != expectedType {
@@ -514,9 +517,9 @@ func TestFactoryOptions(t *testing.T) {
 		}
 
 		factory := NewFactory(
-			WithType(component.MustNewType("test")),
-			WithLifecycleManager(&mockLifecycleManager{}),
-			WithConfigUnmarshaler(&mockConfigUnmarshaler{}),
+			component.MustNewType("test"),
+			&mockLifecycleManager{},
+			&mockConfigUnmarshaler{},
 			WithComponentDefaults(defaults),
 		)
 

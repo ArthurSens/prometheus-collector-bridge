@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
+	"go.uber.org/zap"
 )
 
 // prometheusReceiver implements the receiver.Metrics interface for Prometheus exporters.
@@ -74,7 +75,7 @@ func (r *prometheusReceiver) Start(ctx context.Context, host component.Host) err
 	)
 
 	// Start the scraping loop
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
 	go r.scrapeLoop(ctx)
@@ -103,7 +104,7 @@ func (r *prometheusReceiver) Shutdown(ctx context.Context) error {
 	// Shutdown the exporter
 	if r.lifecycleManager != nil {
 		if err := r.lifecycleManager.Shutdown(ctx); err != nil {
-			r.settings.Logger.Error("Failed to shutdown exporter")
+			r.settings.Logger.Error("Failed to shutdown exporter", zap.Error(err))
 			return fmt.Errorf("failed to shutdown exporter: %w", err)
 		}
 	}
@@ -122,7 +123,7 @@ func (r *prometheusReceiver) scrapeLoop(ctx context.Context) {
 
 	// Perform an immediate scrape on startup
 	if err := r.scrapeAndExport(ctx); err != nil {
-		r.settings.Logger.Error("Initial scrape failed")
+		r.settings.Logger.Error("Initial scrape failed", zap.Error(err))
 	}
 
 	for {
@@ -132,7 +133,7 @@ func (r *prometheusReceiver) scrapeLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.scrapeAndExport(ctx); err != nil {
-				r.settings.Logger.Error("Scrape failed")
+				r.settings.Logger.Error("Scrape failed", zap.Error(err))
 				// Continue scraping even if one scrape fails
 			}
 		}
