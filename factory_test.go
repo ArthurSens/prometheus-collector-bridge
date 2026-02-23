@@ -167,22 +167,23 @@ func TestNewFactory_Panics(t *testing.T) {
 func TestNewFactory_DefaultConfig(t *testing.T) {
 	tests := []struct {
 		name               string
-		componentDefaults  map[string]interface{}
+		opts               []FactoryOption
 		wantScrapeInterval time.Duration
 		wantExporterConfig map[string]interface{}
 	}{
 		{
 			name:               "default config without component defaults",
-			componentDefaults:  nil,
 			wantScrapeInterval: 30 * time.Second,
 			wantExporterConfig: nil,
 		},
 		{
 			name: "default config with component defaults",
-			componentDefaults: map[string]interface{}{
-				"enable_feature": true,
-				"timeout":        "30s",
-				"port":           8080,
+			opts: []FactoryOption{
+				WithComponentDefaults(map[string]interface{}{
+					"enable_feature": true,
+					"timeout":        "30s",
+					"port":           8080,
+				}),
 			},
 			wantScrapeInterval: 30 * time.Second,
 			wantExporterConfig: map[string]interface{}{
@@ -195,16 +196,11 @@ func TestNewFactory_DefaultConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var opts []FactoryOption
-			if tt.componentDefaults != nil {
-				opts = append(opts, WithComponentDefaults(tt.componentDefaults))
-			}
-
 			factory := NewFactory(
 				component.MustNewType("test"),
 				&mockLifecycleManager{},
 				&mockConfigUnmarshaler{},
-				opts...,
+				tt.opts...,
 			)
 			if factory == nil {
 				t.Fatal("NewFactory() returned nil")
