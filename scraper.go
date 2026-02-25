@@ -18,91 +18,401 @@ import (
 	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
-	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	otelbridge "go.opentelemetry.io/contrib/bridges/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.uber.org/zap"
 )
 
 // scraper handles scraping metrics from a Prometheus registry and converting
-// them to OpenTelemetry format.
+// them to OpenTelemetry Collector format.
+//
+// Architecture:
+//  1. Prometheus Registry → OTel Prometheus Bridge (go.opentelemetry.io/contrib/bridges/prometheus)
+//     The bridge handles all Prometheus-specific concerns: counter/gauge/histogram/summary
+//     type inference, label handling, and help text extraction.
+//  2. Bridge produces SDK metricdata.ScopeMetrics via the metric.Producer interface.
+//  3. This package converts SDK metricdata → Collector pmetric.Metrics.
+//     No public library exists for this conversion; the OTel SDK's own OTLP exporters
+//     contain equivalent logic in internal packages not intended for external use.
 type scraper struct {
-	registry  *prometheus.Registry
-	consumer  consumer.Metrics
-	logger    *zap.Logger
-	converter *converter
+	logger       *zap.Logger
+	producer     metric.Producer
+	receiverType string
 }
 
 // newScraper creates a new scraper instance.
 func newScraper(
 	registry *prometheus.Registry,
-	consumer consumer.Metrics,
+	receiverType component.Type,
 	logger *zap.Logger,
 ) *scraper {
+	producer := otelbridge.NewMetricProducer(
+		otelbridge.WithGatherer(registry),
+	)
+
 	return &scraper{
-		registry:  registry,
-		consumer:  consumer,
-		logger:    logger,
-		converter: newConverter(),
+		logger:       logger,
+		producer:     producer,
+		receiverType: receiverType.String(),
 	}
 }
 
 // Scrape collects metrics from the Prometheus registry and converts them
 // to OpenTelemetry pmetric.Metrics format.
 func (s *scraper) Scrape(ctx context.Context) (pmetric.Metrics, error) {
-	// Gather metrics from the Prometheus registry
-	metricFamilies, err := s.registry.Gather()
+	s.logger.Debug("Scraping metrics")
+
+	scopeMetrics, err := s.producer.Produce(ctx)
 	if err != nil {
-		return pmetric.Metrics{}, fmt.Errorf("failed to gather metrics: %w", err)
+		return pmetric.Metrics{}, fmt.Errorf("failed to produce metrics: %w", err)
 	}
 
-	s.logger.Debug("Gathered metrics from registry")
+	metrics := s.convert(scopeMetrics)
 
-	// Convert Prometheus metrics to OpenTelemetry format
-	metrics := pmetric.NewMetrics()
-
-	// TODO: Implement conversion in Phase 2
-	// For now, create a placeholder that will be replaced with actual conversion logic
-	if err := s.convertMetrics(metricFamilies, metrics); err != nil {
-		return pmetric.Metrics{}, fmt.Errorf("failed to convert metrics: %w", err)
-	}
+	s.logger.Debug("Finished scraping metrics",
+		zap.Int("metrics", metrics.ResourceMetrics().Len()))
 
 	return metrics, nil
 }
 
-// convertMetrics converts Prometheus metric families to OpenTelemetry metrics.
-func (s *scraper) convertMetrics(metricFamilies []*dto.MetricFamily, dest pmetric.Metrics) error {
-	if len(metricFamilies) == 0 {
-		s.logger.Debug("No metrics to convert")
-		return nil
+// convert converts SDK metricdata.ScopeMetrics to collector pmetric.Metrics.
+func (s *scraper) convert(scopeMetrics []metricdata.ScopeMetrics) pmetric.Metrics {
+	if len(scopeMetrics) == 0 {
+		s.logger.Debug("No scope metrics to convert")
+		return pmetric.NewMetrics()
 	}
 
-	// Create a resource metrics entry
-	rm := dest.ResourceMetrics().AppendEmpty()
+	metrics := pmetric.NewMetrics()
+	rm := metrics.ResourceMetrics().AppendEmpty()
+	rm.Resource().Attributes().PutStr("service.name", s.receiverType)
 
-	// Add resource attributes
-	rm.Resource().Attributes().PutStr("service.name", "prometheus-exporter")
-	rm.Resource().Attributes().PutStr("exporter.type", "prometheus")
-
-	// Create a scope metrics entry
-	sm := rm.ScopeMetrics().AppendEmpty()
-	sm.Scope().SetName("prometheus_exporter")
-	sm.Scope().SetVersion("1.0.0")
-
-	// Convert each metric family
-	for _, mf := range metricFamilies {
-		if mf == nil {
-			continue
-		}
-
-		err := s.converter.convertMetricFamily(mf, sm)
-		if err != nil {
-			s.logger.Debug("Failed to convert metric family")
-			continue
-		}
+	for _, sm := range scopeMetrics {
+		s.convertScopeMetrics(sm, rm)
 	}
 
-	s.logger.Debug("Converted Prometheus metrics to OpenTelemetry format")
+	return metrics
+}
 
+// convertScopeMetrics converts a single SDK ScopeMetrics to pmetric format.
+func (s *scraper) convertScopeMetrics(sm metricdata.ScopeMetrics, rm pmetric.ResourceMetrics) {
+	scopeMetrics := rm.ScopeMetrics().AppendEmpty()
+
+	scope := scopeMetrics.Scope()
+	scope.SetName(sm.Scope.Name)
+	scope.SetVersion(sm.Scope.Version)
+	s.convertAttributes(sm.Scope.Attributes, scope.Attributes())
+
+	for _, m := range sm.Metrics {
+		if err := s.convertMetric(m, scopeMetrics); err != nil {
+			s.logger.Debug("Failed to convert metric",
+				zap.String("metric", m.Name),
+				zap.Error(err))
+		}
+	}
+}
+
+// convertMetric converts a single SDK Metrics to pmetric format.
+//
+// This method dispatches to type-specific converters based on the metric data type.
+// Each converter handles the peculiarities of its metric type (data points, temporality, etc.).
+func (s *scraper) convertMetric(sdkMetric metricdata.Metrics, scopeMetrics pmetric.ScopeMetrics) error {
+	switch data := sdkMetric.Data.(type) {
+	case metricdata.Gauge[int64],
+		metricdata.Gauge[float64],
+		metricdata.Sum[int64],
+		metricdata.Sum[float64],
+		metricdata.Histogram[int64],
+		metricdata.Histogram[float64],
+		metricdata.ExponentialHistogram[int64],
+		metricdata.ExponentialHistogram[float64],
+		metricdata.Summary:
+		_ = data
+	default:
+		return fmt.Errorf("unsupported metric data type: %T", data)
+	}
+
+	metric := scopeMetrics.Metrics().AppendEmpty()
+	metric.SetName(sdkMetric.Name)
+	metric.SetDescription(sdkMetric.Description)
+	metric.SetUnit(sdkMetric.Unit)
+
+	switch data := sdkMetric.Data.(type) {
+	case metricdata.Gauge[int64]:
+		s.convertGaugeInt64(data, metric)
+	case metricdata.Gauge[float64]:
+		s.convertGaugeFloat64(data, metric)
+	case metricdata.Sum[int64]:
+		s.convertSumInt64(data, metric)
+	case metricdata.Sum[float64]:
+		s.convertSumFloat64(data, metric)
+	case metricdata.Histogram[int64]:
+		s.convertHistogramInt64(data, metric)
+	case metricdata.Histogram[float64]:
+		s.convertHistogramFloat64(data, metric)
+	case metricdata.ExponentialHistogram[int64]:
+		s.convertExponentialHistogramInt64(data, metric)
+	case metricdata.ExponentialHistogram[float64]:
+		s.convertExponentialHistogramFloat64(data, metric)
+	case metricdata.Summary:
+		s.convertSummary(data, metric)
+	default:
+		panic("unreachable")
+	}
 	return nil
+}
+
+// convertGaugeInt64 converts an int64 gauge to pmetric format.
+func (s *scraper) convertGaugeInt64(gauge metricdata.Gauge[int64], metric pmetric.Metric) {
+	g := metric.SetEmptyGauge()
+	for _, dp := range gauge.DataPoints {
+		dataPoint := g.DataPoints().AppendEmpty()
+		dataPoint.SetIntValue(dp.Value)
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertGaugeFloat64 converts a float64 gauge to pmetric format.
+func (s *scraper) convertGaugeFloat64(gauge metricdata.Gauge[float64], metric pmetric.Metric) {
+	g := metric.SetEmptyGauge()
+	for _, dp := range gauge.DataPoints {
+		dataPoint := g.DataPoints().AppendEmpty()
+		dataPoint.SetDoubleValue(dp.Value)
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertSumInt64 converts an int64 sum to pmetric format.
+func (s *scraper) convertSumInt64(sum metricdata.Sum[int64], metric pmetric.Metric) {
+	sv := metric.SetEmptySum()
+	sv.SetIsMonotonic(sum.IsMonotonic)
+	sv.SetAggregationTemporality(s.convertTemporality(sum.Temporality))
+
+	for _, dp := range sum.DataPoints {
+		dataPoint := sv.DataPoints().AppendEmpty()
+		dataPoint.SetIntValue(dp.Value)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertSumFloat64 converts a float64 sum to pmetric format.
+func (s *scraper) convertSumFloat64(sum metricdata.Sum[float64], metric pmetric.Metric) {
+	sv := metric.SetEmptySum()
+	sv.SetIsMonotonic(sum.IsMonotonic)
+	sv.SetAggregationTemporality(s.convertTemporality(sum.Temporality))
+
+	for _, dp := range sum.DataPoints {
+		dataPoint := sv.DataPoints().AppendEmpty()
+		dataPoint.SetDoubleValue(dp.Value)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertHistogramInt64 converts an int64 histogram to pmetric format.
+func (s *scraper) convertHistogramInt64(hist metricdata.Histogram[int64], metric pmetric.Metric) {
+	h := metric.SetEmptyHistogram()
+	h.SetAggregationTemporality(s.convertTemporality(hist.Temporality))
+
+	for _, dp := range hist.DataPoints {
+		dataPoint := h.DataPoints().AppendEmpty()
+		dataPoint.SetCount(dp.Count)
+		dataPoint.SetSum(float64(dp.Sum))
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+
+		if min, defined := dp.Min.Value(); defined {
+			dataPoint.SetMin(float64(min))
+		}
+		if max, defined := dp.Max.Value(); defined {
+			dataPoint.SetMax(float64(max))
+		}
+
+		dataPoint.BucketCounts().FromRaw(dp.BucketCounts)
+		dataPoint.ExplicitBounds().FromRaw(dp.Bounds)
+
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertHistogramFloat64 converts a float64 histogram to pmetric format.
+func (s *scraper) convertHistogramFloat64(hist metricdata.Histogram[float64], metric pmetric.Metric) {
+	h := metric.SetEmptyHistogram()
+	h.SetAggregationTemporality(s.convertTemporality(hist.Temporality))
+
+	for _, dp := range hist.DataPoints {
+		dataPoint := h.DataPoints().AppendEmpty()
+		dataPoint.SetCount(dp.Count)
+		dataPoint.SetSum(dp.Sum)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+
+		if min, defined := dp.Min.Value(); defined {
+			dataPoint.SetMin(min)
+		}
+		if max, defined := dp.Max.Value(); defined {
+			dataPoint.SetMax(max)
+		}
+
+		dataPoint.BucketCounts().FromRaw(dp.BucketCounts)
+		dataPoint.ExplicitBounds().FromRaw(dp.Bounds)
+
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertExponentialHistogramInt64 converts an int64 exponential histogram to pmetric format.
+func (s *scraper) convertExponentialHistogramInt64(hist metricdata.ExponentialHistogram[int64], metric pmetric.Metric) {
+	h := metric.SetEmptyExponentialHistogram()
+	h.SetAggregationTemporality(s.convertTemporality(hist.Temporality))
+
+	for _, dp := range hist.DataPoints {
+		dataPoint := h.DataPoints().AppendEmpty()
+		dataPoint.SetCount(dp.Count)
+		dataPoint.SetSum(float64(dp.Sum))
+		dataPoint.SetScale(dp.Scale)
+		dataPoint.SetZeroCount(dp.ZeroCount)
+		dataPoint.SetZeroThreshold(dp.ZeroThreshold)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+
+		if min, defined := dp.Min.Value(); defined {
+			dataPoint.SetMin(float64(min))
+		}
+		if max, defined := dp.Max.Value(); defined {
+			dataPoint.SetMax(float64(max))
+		}
+
+		positive := dataPoint.Positive()
+		positive.SetOffset(dp.PositiveBucket.Offset)
+		positive.BucketCounts().FromRaw(dp.PositiveBucket.Counts)
+
+		negative := dataPoint.Negative()
+		negative.SetOffset(dp.NegativeBucket.Offset)
+		negative.BucketCounts().FromRaw(dp.NegativeBucket.Counts)
+
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertExponentialHistogramFloat64 converts a float64 exponential histogram to pmetric format.
+func (s *scraper) convertExponentialHistogramFloat64(hist metricdata.ExponentialHistogram[float64], metric pmetric.Metric) {
+	h := metric.SetEmptyExponentialHistogram()
+	h.SetAggregationTemporality(s.convertTemporality(hist.Temporality))
+
+	for _, dp := range hist.DataPoints {
+		dataPoint := h.DataPoints().AppendEmpty()
+		dataPoint.SetCount(dp.Count)
+		dataPoint.SetSum(dp.Sum)
+		dataPoint.SetScale(dp.Scale)
+		dataPoint.SetZeroCount(dp.ZeroCount)
+		dataPoint.SetZeroThreshold(dp.ZeroThreshold)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+
+		if min, defined := dp.Min.Value(); defined {
+			dataPoint.SetMin(min)
+		}
+		if max, defined := dp.Max.Value(); defined {
+			dataPoint.SetMax(max)
+		}
+
+		positive := dataPoint.Positive()
+		positive.SetOffset(dp.PositiveBucket.Offset)
+		positive.BucketCounts().FromRaw(dp.PositiveBucket.Counts)
+
+		negative := dataPoint.Negative()
+		negative.SetOffset(dp.NegativeBucket.Offset)
+		negative.BucketCounts().FromRaw(dp.NegativeBucket.Counts)
+
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertSummary converts a summary to pmetric format.
+func (s *scraper) convertSummary(summary metricdata.Summary, metric pmetric.Metric) {
+	sv := metric.SetEmptySummary()
+
+	for _, dp := range summary.DataPoints {
+		dataPoint := sv.DataPoints().AppendEmpty()
+		dataPoint.SetCount(dp.Count)
+		dataPoint.SetSum(dp.Sum)
+		dataPoint.SetStartTimestamp(pcommon.Timestamp(dp.StartTime.UnixNano()))
+		dataPoint.SetTimestamp(pcommon.Timestamp(dp.Time.UnixNano()))
+
+		for _, quantile := range dp.QuantileValues {
+			qv := dataPoint.QuantileValues().AppendEmpty()
+			qv.SetQuantile(quantile.Quantile)
+			qv.SetValue(quantile.Value)
+		}
+
+		s.convertAttributes(dp.Attributes, dataPoint.Attributes())
+	}
+}
+
+// convertTemporality converts SDK temporality to pmetric temporality.
+func (s *scraper) convertTemporality(temporality metricdata.Temporality) pmetric.AggregationTemporality {
+	switch temporality {
+	case metricdata.CumulativeTemporality:
+		return pmetric.AggregationTemporalityCumulative
+	case metricdata.DeltaTemporality:
+		return pmetric.AggregationTemporalityDelta
+	default:
+		return pmetric.AggregationTemporalityUnspecified
+	}
+}
+
+// convertAttributes converts SDK attributes to pmetric attributes.
+//
+// Handles all OpenTelemetry attribute types including primitives and slice variants.
+// The type switch mirrors the pattern in the OTel SDK's own attribute transform,
+// adapted to write into pcommon.Map instead of OTLP protobuf:
+//
+//	https://github.com/open-telemetry/opentelemetry-go/blob/main/exporters/otlp/otlpmetric/otlpmetricgrpc/internal/transform/attribute.go
+func (s *scraper) convertAttributes(attrs attribute.Set, dest pcommon.Map) {
+	iter := attrs.Iter()
+	for iter.Next() {
+		kv := iter.Attribute()
+		key := string(kv.Key)
+
+		switch kv.Value.Type() {
+		case attribute.BOOL:
+			dest.PutBool(key, kv.Value.AsBool())
+		case attribute.INT64:
+			dest.PutInt(key, kv.Value.AsInt64())
+		case attribute.FLOAT64:
+			dest.PutDouble(key, kv.Value.AsFloat64())
+		case attribute.STRING:
+			dest.PutStr(key, kv.Value.AsString())
+		case attribute.BOOLSLICE:
+			slice := dest.PutEmptySlice(key)
+			for _, v := range kv.Value.AsBoolSlice() {
+				slice.AppendEmpty().SetBool(v)
+			}
+		case attribute.INT64SLICE:
+			slice := dest.PutEmptySlice(key)
+			for _, v := range kv.Value.AsInt64Slice() {
+				slice.AppendEmpty().SetInt(v)
+			}
+		case attribute.FLOAT64SLICE:
+			slice := dest.PutEmptySlice(key)
+			for _, v := range kv.Value.AsFloat64Slice() {
+				slice.AppendEmpty().SetDouble(v)
+			}
+		case attribute.STRINGSLICE:
+			slice := dest.PutEmptySlice(key)
+			for _, v := range kv.Value.AsStringSlice() {
+				slice.AppendEmpty().SetStr(v)
+			}
+		}
+	}
 }
