@@ -30,6 +30,7 @@ import (
 // Conversion correctness is tested in scraper_test.go; this test only verifies
 // that metrics flow end-to-end through the pipeline.
 func TestEndToEnd_FullReceiverPipeline(t *testing.T) {
+	shutdownCalled := false
 	lifecycleManager := &mockLifecycleManager{
 		startFunc: func(ctx context.Context, cfg Config) (*prometheus.Registry, error) {
 			reg := prometheus.NewRegistry()
@@ -48,6 +49,10 @@ func TestEndToEnd_FullReceiverPipeline(t *testing.T) {
 			gauge.Set(42)
 
 			return reg, nil
+		},
+		shutdownFunc: func(ctx context.Context) error {
+			shutdownCalled = true
+			return nil
 		},
 	}
 
@@ -103,6 +108,9 @@ func TestEndToEnd_FullReceiverPipeline(t *testing.T) {
 	err = receiver.Shutdown(context.Background())
 	if err != nil {
 		t.Fatalf("Shutdown() failed: %v", err)
+	}
+	if !shutdownCalled {
+		t.Error("lifecycle manager Shutdown() was not called")
 	}
 }
 
@@ -163,62 +171,5 @@ func TestEndToEnd_MultipleScrapes(t *testing.T) {
 	err = receiver.Shutdown(context.Background())
 	if err != nil {
 		t.Fatalf("Shutdown() failed: %v", err)
-	}
-}
-
-// TestEndToEnd_GracefulShutdown verifies that the receiver shuts down cleanly
-// without leaking goroutines or leaving resources open.
-func TestEndToEnd_GracefulShutdown(t *testing.T) {
-	shutdownCalled := false
-	lifecycleManager := &mockLifecycleManager{
-		startFunc: func(ctx context.Context, cfg Config) (*prometheus.Registry, error) {
-			reg := prometheus.NewRegistry()
-			gauge := prometheus.NewGauge(prometheus.GaugeOpts{
-				Name: "shutdown_test",
-				Help: "test",
-			})
-			reg.MustRegister(gauge)
-			gauge.Set(1)
-			return reg, nil
-		},
-		shutdownFunc: func(ctx context.Context) error {
-			shutdownCalled = true
-			return nil
-		},
-	}
-
-	receiverType := component.MustNewType("shutdowntest")
-	factory := NewFactory(receiverType, lifecycleManager, &mockConfigUnmarshaler{})
-
-	cfg := &ReceiverConfig{
-		ScrapeInterval: 1 * time.Second,
-	}
-
-	sink := new(consumertest.MetricsSink)
-	set := receivertest.NewNopSettings(receiverType)
-
-	receiver, err := factory.CreateMetrics(context.Background(), set, cfg, sink)
-	if err != nil {
-		t.Fatalf("CreateMetrics() failed: %v", err)
-	}
-
-	err = receiver.Start(context.Background(), componenttest.NewNopHost())
-	if err != nil {
-		t.Fatalf("Start() failed: %v", err)
-	}
-
-	// Give it a moment to start
-	time.Sleep(50 * time.Millisecond)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	err = receiver.Shutdown(ctx)
-	if err != nil {
-		t.Fatalf("Shutdown() failed: %v", err)
-	}
-
-	if !shutdownCalled {
-		t.Error("lifecycle manager Shutdown() was not called")
 	}
 }
