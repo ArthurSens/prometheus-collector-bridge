@@ -268,6 +268,55 @@ func TestScraper_HistogramConversion(t *testing.T) {
 	}
 }
 
+func TestScraper_ExponentialHistogramConversion(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	histogram := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:                        "native_request_duration_seconds",
+		Help:                        "Request duration as native histogram",
+		NativeHistogramBucketFactor: 1.1,
+	})
+	registry.MustRegister(histogram)
+
+	histogram.Observe(0.01)
+	histogram.Observe(0.5)
+	histogram.Observe(2.5)
+
+	s := newScraper(registry, component.MustNewType("test"), zap.NewNop())
+	metrics, err := s.Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape() returned unexpected error: %v", err)
+	}
+
+	metric := findMetric(t, metrics, "native_request_duration_seconds")
+	if metric.Type() != pmetric.MetricTypeExponentialHistogram {
+		t.Fatalf("metric type = %v, want ExponentialHistogram", metric.Type())
+	}
+
+	expHist := metric.ExponentialHistogram()
+	if expHist.AggregationTemporality() != pmetric.AggregationTemporalityCumulative {
+		t.Errorf("temporality = %v, want Cumulative", expHist.AggregationTemporality())
+	}
+
+	if expHist.DataPoints().Len() != 1 {
+		t.Fatalf("expected 1 exponential histogram data point, got %d", expHist.DataPoints().Len())
+	}
+
+	dp := expHist.DataPoints().At(0)
+	if dp.Count() != 3 {
+		t.Errorf("count = %d, want 3", dp.Count())
+	}
+	wantSum := 0.01 + 0.5 + 2.5
+	if dp.Sum() < wantSum-0.001 || dp.Sum() > wantSum+0.001 {
+		t.Errorf("sum = %f, want ~%f", dp.Sum(), wantSum)
+	}
+	if dp.Scale() == 0 && dp.Positive().BucketCounts().Len() == 0 {
+		t.Error("expected non-trivial exponential histogram bucket structure")
+	}
+	if dp.Timestamp() == 0 {
+		t.Error("data point has zero timestamp")
+	}
+}
+
 func TestScraper_SummaryConversion(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	summary := prometheus.NewSummaryVec(prometheus.SummaryOpts{
@@ -278,7 +327,7 @@ func TestScraper_SummaryConversion(t *testing.T) {
 	registry.MustRegister(summary)
 
 	for i := 0; i < 100; i++ {
-		summary.WithLabelValues("auth").Observe(float64(i) * 0.01)
+		summary.WithLabelValues("auth").Observe(float64(i) * 0.5)
 	}
 
 	s := newScraper(registry, component.MustNewType("test"), zap.NewNop())
@@ -301,8 +350,8 @@ func TestScraper_SummaryConversion(t *testing.T) {
 	if dp.Count() != 100 {
 		t.Errorf("summary count = %d, want 100", dp.Count())
 	}
-	if dp.Sum() == 0 {
-		t.Error("summary sum should not be zero")
+	if dp.Sum() != 2475.0 {
+		t.Errorf("summary sum = %f, want 2475.0", dp.Sum())
 	}
 
 	if dp.QuantileValues().Len() != 3 {
